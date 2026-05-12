@@ -1,0 +1,11 @@
+{
+  "urls": [
+    "https://www.rottentomatoes.com/m/mortal_kombat_ii#critics-reviews"
+  ],
+  "reviewType": "all-critics",
+  "results_wanted": 20,
+  "max_pages": 10,
+  "proxyConfiguration": {
+    "useApifyProxy": false
+  }
+}

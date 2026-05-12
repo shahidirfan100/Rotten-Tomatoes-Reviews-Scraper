@@ -1,0 +1,67 @@
+{
+  "title": "Rotten Tomatoes Reviews Scraper",
+  "description": "Collect Rotten Tomatoes movie reviews from one or multiple movie URLs.",
+  "type": "object",
+  "schemaVersion": 1,
+  "properties": {
+    "urls": {
+      "title": "Movie URLs",
+      "type": "array",
+      "description": "Add one or more Rotten Tomatoes movie URLs. Supports messy variants like /reviews, query params, and hash fragments.",
+      "editor": "stringList",
+      "prefill": [
+        "https://www.rottentomatoes.com/m/mortal_kombat_ii#critics-reviews"
+      ],
+      "items": {
+        "type": "string"
+      }
+    },
+    "reviewType": {
+      "title": "Review Type",
+      "type": "string",
+      "description": "Review set to collect.",
+      "editor": "select",
+      "default": "all-critics",
+      "prefill": "all-critics",
+      "enum": [
+        "all-critics",
+        "top-critics",
+        "all-audience",
+        "verified-audience"
+      ],
+      "enumTitles": [
+        "All Critics",
+        "Top Critics",
+        "All Audience",
+        "Verified Audience"
+      ]
+    },
+    "results_wanted": {
+      "title": "Results Wanted",
+      "type": "integer",
+      "description": "Maximum number of reviews to collect.",
+      "default": 20,
+      "prefill": 20,
+      "editor": "number"
+    },
+    "max_pages": {
+      "title": "Max Pages",
+      "type": "integer",
+      "description": "Maximum API pages to request per movie.",
+      "default": 10,
+      "prefill": 10,
+      "editor": "number"
+    },
+    "proxyConfiguration": {
+      "title": "Proxy Configuration",
+      "type": "object",
+      "description": "Proxy settings for request routing.",
+      "editor": "proxy",
+      "default": {
+        "useApifyProxy": false
+      }
+    }
+  },
+  "required": [],
+  "additionalProperties": false
+}

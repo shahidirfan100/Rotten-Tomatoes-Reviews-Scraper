@@ -1,0 +1,117 @@
+{
+  "actorSpecification": 1,
+  "fields": {
+    "movieTitle": {
+      "title": "Movie Title",
+      "type": "string",
+      "description": "Movie title"
+    },
+    "queryReviewType": {
+      "title": "Review Type",
+      "type": "string",
+      "description": "Selected review type"
+    },
+    "createDate": {
+      "title": "Review Date",
+      "type": "string",
+      "description": "Review creation timestamp"
+    },
+    "scoreSentiment": {
+      "title": "Sentiment",
+      "type": "string",
+      "description": "Review sentiment label"
+    },
+    "rating": {
+      "title": "Rating",
+      "type": "string",
+      "description": "Audience rating value"
+    },
+    "originalScore": {
+      "title": "Original Score",
+      "type": "string",
+      "description": "Original critic score text"
+    },
+    "quote": {
+      "title": "Quote",
+      "type": "string",
+      "description": "Review text"
+    },
+    "criticName": {
+      "title": "Critic",
+      "type": "string",
+      "description": "Critic name when available"
+    },
+    "publicationName": {
+      "title": "Publication",
+      "type": "string",
+      "description": "Publication name when available"
+    },
+    "userDisplayName": {
+      "title": "Audience User",
+      "type": "string",
+      "description": "Audience display name"
+    },
+    "isVerified": {
+      "title": "Verified",
+      "type": "boolean",
+      "description": "Whether audience review is verified"
+    },
+    "isTopReview": {
+      "title": "Top Review",
+      "type": "boolean",
+      "description": "Whether critic review is top review"
+    },
+    "movieUrl": {
+      "title": "Movie URL",
+      "type": "string",
+      "description": "Canonical movie URL"
+    },
+    "fullReviewUrl": {
+      "title": "Full Review URL",
+      "type": "string",
+      "description": "Link to full external review"
+    }
+  },
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "movieTitle",
+          "queryReviewType",
+          "createDate",
+          "scoreSentiment",
+          "rating",
+          "originalScore",
+          "quote",
+          "criticName",
+          "publicationName",
+          "userDisplayName",
+          "isVerified",
+          "isTopReview",
+          "movieUrl",
+          "fullReviewUrl"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "movieTitle": { "label": "Movie", "format": "text" },
+          "queryReviewType": { "label": "Review Type", "format": "text" },
+          "createDate": { "label": "Date", "format": "date" },
+          "scoreSentiment": { "label": "Sentiment", "format": "text" },
+          "rating": { "label": "Rating", "format": "text" },
+          "originalScore": { "label": "Original Score", "format": "text" },
+          "quote": { "label": "Quote", "format": "text" },
+          "criticName": { "label": "Critic", "format": "text" },
+          "publicationName": { "label": "Publication", "format": "text" },
+          "userDisplayName": { "label": "Audience User", "format": "text" },
+          "isVerified": { "label": "Verified", "format": "boolean" },
+          "isTopReview": { "label": "Top Review", "format": "boolean" },
+          "movieUrl": { "label": "Movie URL", "format": "link" },
+          "fullReviewUrl": { "label": "Full Review", "format": "link" }
+        }
+      }
+    }
+  }
+}
