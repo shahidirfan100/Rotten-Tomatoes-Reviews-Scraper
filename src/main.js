@@ -6,6 +6,9 @@ const BASE_URL = 'https://www.rottentomatoes.com';
 const DEFAULT_RESULTS_WANTED = 20;
 const DEFAULT_MAX_PAGES = 10;
 const PAGE_SIZE = 20;
+const REQUEST_RETRY_ATTEMPTS = 3;
+const REQUEST_TIMEOUT_MS = 30000;
+const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 const REVIEW_TYPE_TO_PARAMS = {
     'all-critics': { type: 'critic', topOnly: false, verified: false },
@@ -20,6 +23,47 @@ function clampInteger(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
     const parsed = Number.parseInt(String(value ?? ''), 10);
     if (!Number.isFinite(parsed)) return fallback;
     return Math.min(Math.max(parsed, min), max);
+}
+
+function delay(ms) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+}
+
+function getInputValue(candidate) {
+    if (typeof candidate === 'string') return candidate;
+    if (candidate && typeof candidate === 'object') {
+        return candidate.url || candidate.URL || candidate.href || candidate.HREF || candidate.value || candidate.VALUE;
+    }
+    return null;
+}
+
+function getField(value, ...keys) {
+    if (!value || typeof value !== 'object') return undefined;
+
+    for (const key of keys) {
+        if (Object.prototype.hasOwnProperty.call(value, key)) return value[key];
+
+        const normalizedKey = key.toLowerCase();
+        const matchedKey = Object.keys(value).find((existingKey) => existingKey.toLowerCase() === normalizedKey);
+        if (matchedKey) return value[matchedKey];
+    }
+
+    return undefined;
+}
+
+function getPath(value, path) {
+    return path.reduce((current, key) => getField(current, key), value);
+}
+
+function parseJsonSafely(body, context) {
+    try {
+        return JSON.parse(body);
+    } catch (error) {
+        log.warning(`Failed parsing JSON from ${context}: ${error.message}`);
+        return null;
+    }
 }
 
 function cleanObject(value) {
@@ -49,13 +93,22 @@ function cleanObject(value) {
 }
 
 function normalizeMovieUrl(rawUrl) {
+    const inputValue = getInputValue(rawUrl);
+    if (!inputValue || typeof inputValue !== 'string') return null;
+
+    let cleanedUrl = inputValue.trim();
+    if (!cleanedUrl) return null;
+
+    if (cleanedUrl.startsWith('www.')) cleanedUrl = `https://${cleanedUrl}`;
+    if (cleanedUrl.startsWith('/')) cleanedUrl = `${BASE_URL}${cleanedUrl}`;
+
     try {
-        const parsed = new URL(rawUrl, BASE_URL);
+        const parsed = new URL(cleanedUrl, BASE_URL);
         const host = parsed.hostname.toLowerCase();
         if (!host.includes('rottentomatoes.com')) return null;
 
         const segments = parsed.pathname.split('/').filter(Boolean);
-        if (segments[0] !== 'm' || !segments[1]) return null;
+        if ((segments[0] || '').toLowerCase() !== 'm' || !segments[1]) return null;
 
         return `${BASE_URL}/m/${segments[1]}`;
     } catch {
@@ -64,9 +117,14 @@ function normalizeMovieUrl(rawUrl) {
 }
 
 function parseQueryReviewType(urlString) {
+    const inputValue = getInputValue(urlString);
+    if (!inputValue || typeof inputValue !== 'string') return null;
+
     try {
-        const parsed = new URL(urlString, BASE_URL);
-        const type = (parsed.searchParams.get('type') || '').toLowerCase();
+        const parsed = new URL(inputValue.trim(), BASE_URL);
+        const typeParam = [...parsed.searchParams.entries()]
+            .find(([key]) => key.toLowerCase() === 'type')?.[1];
+        const type = (typeParam || '').toLowerCase();
         if (type === 'user' || type === 'all_audience' || type === 'all-audience') return 'all-audience';
         if (type === 'verified_audience' || type === 'verified-audience') return 'verified-audience';
         if (type === 'top_critics' || type === 'top-critics') return 'top-critics';
@@ -93,21 +151,45 @@ function extractDataJsonBlock(html, key) {
 }
 
 async function requestWithProxy(proxyConfig, url, options = {}) {
-    const proxyUrl = proxyConfig ? await proxyConfig.newUrl() : undefined;
+    let lastError;
 
-    return gotScraping({
-        url,
-        proxyUrl,
-        throwHttpErrors: false,
-        retry: { limit: 2 },
-        headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
-            Accept: 'application/json, text/plain, */*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            ...(options.headers || {}),
-        },
-        ...options,
-    });
+    for (let attempt = 1; attempt <= REQUEST_RETRY_ATTEMPTS; attempt += 1) {
+        const proxyUrl = proxyConfig ? await proxyConfig.newUrl() : undefined;
+
+        try {
+            const response = await gotScraping({
+                url,
+                proxyUrl,
+                throwHttpErrors: false,
+                retry: { limit: 0 },
+                timeout: { request: REQUEST_TIMEOUT_MS },
+                ...options,
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
+                    Accept: 'application/json, text/plain, */*',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    ...(options.headers || {}),
+                },
+            });
+
+            if (!RETRYABLE_STATUS_CODES.has(response.statusCode) || attempt === REQUEST_RETRY_ATTEMPTS) {
+                return response;
+            }
+
+            const retryAfter = Number.parseInt(response.headers?.['retry-after'] || '', 10);
+            const waitMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 750 * attempt;
+            log.warning(`Temporary HTTP ${response.statusCode} for ${url}. Retrying attempt ${attempt + 1}/${REQUEST_RETRY_ATTEMPTS}.`);
+            await delay(waitMs);
+        } catch (error) {
+            lastError = error;
+            if (attempt === REQUEST_RETRY_ATTEMPTS) break;
+
+            log.warning(`Request failed for ${url}: ${error.message}. Retrying attempt ${attempt + 1}/${REQUEST_RETRY_ATTEMPTS}.`);
+            await delay(750 * attempt);
+        }
+    }
+
+    throw lastError;
 }
 
 async function resolveMovieContext(movieUrl, proxyConfig) {
@@ -126,28 +208,30 @@ async function resolveMovieContext(movieUrl, proxyConfig) {
     const props = extractDataJsonBlock(response.body, 'props');
     const reviewsData = extractDataJsonBlock(response.body, 'reviewsData');
 
-    const emsId = props?.vanity?.emsId || props?.media?.emsId || reviewsData?.media?.emsId;
+    const emsId = getPath(props, ['vanity', 'emsId'])
+        || getPath(props, ['media', 'emsId'])
+        || getPath(reviewsData, ['media', 'emsId']);
     if (!emsId) {
         throw new Error(`Failed to resolve movie ID from ${reviewsPageUrl}`);
     }
 
     const movieDetailsUrl = `${BASE_URL}/napi/rtcf/v1/movies/${emsId}`;
-    const detailsResponse = await requestWithProxy(proxyConfig, movieDetailsUrl, {
-        headers: {
-            Referer: reviewsPageUrl,
-        },
-    });
-
-    if (detailsResponse.statusCode !== 200) {
-        throw new Error(`Failed to fetch movie details (${detailsResponse.statusCode}) for ID: ${emsId}`);
-    }
-
-    let movieDetails = null;
+    let movieDetails = {};
     try {
-        const parsed = JSON.parse(detailsResponse.body);
-        movieDetails = Array.isArray(parsed) ? parsed[0]?.movieDetail : parsed?.movieDetail;
-    } catch {
-        movieDetails = null;
+        const detailsResponse = await requestWithProxy(proxyConfig, movieDetailsUrl, {
+            headers: {
+                Referer: reviewsPageUrl,
+            },
+        });
+
+        if (detailsResponse.statusCode !== 200) {
+            log.warning(`Failed to fetch movie details (${detailsResponse.statusCode}) for ID: ${emsId}. Continuing with review data only.`);
+        } else {
+            const parsed = parseJsonSafely(detailsResponse.body, `movie details API for ID ${emsId}`);
+            movieDetails = Array.isArray(parsed) ? getField(parsed[0], 'movieDetail') : getField(parsed, 'movieDetail');
+        }
+    } catch (error) {
+        log.warning(`Failed to fetch movie details for ID ${emsId}: ${error.message}. Continuing with review data only.`);
     }
 
     return {
@@ -165,45 +249,45 @@ function buildReviewRecord({ review, movieContext, reviewType, page }) {
     const baseRecord = {
         queryReviewType: reviewType,
         page,
-        movieTitle: movieDetail.title || movieContext.props?.media?.title,
-        movieUrl: movieDetail.rottenTomatoesUrl || movieContext.movieUrl,
-        mediaUrl: movieDetail.mediaUrl,
-        movieVanity: movieDetail.vanity || movieContext.props?.vanity?.value,
-        movieEmsId: movieDetail.emsMovieId || movieContext.emsId,
-        rottenTomatoesMovieId: movieDetail.rottenTomatoesMovieId,
-        fandangoMovieId: movieDetail.fandangoMovieId,
-        releaseDate: movieDetail.lifecycleWindow?.date,
-        releaseLifecycle: movieDetail.lifecycleWindow?.lifecycle,
-        tomatometerScore: movieDetail.tomatometerScore?.score,
-        tomatometerSentiment: movieDetail.tomatometerScore?.scoreSentiment,
-        audienceScore: movieDetail.audienceScore?.score,
-        audienceSentiment: movieDetail.audienceScore?.scoreSentiment,
-        criticsConsensus: movieDetail.criticsConsensus?.consensus,
-        audienceConsensus: movieDetail.audienceConsensus?.consensus,
-        reviewId: review.reviewId,
-        ratingId: review.ratingId,
-        createDate: review.createDate,
-        updateDate: review.updateDate,
-        scoreSentiment: review.scoreSentiment,
-        originalScore: review.originalScore,
-        rating: review.rating,
-        isTopReview: review.isTopReview,
-        isFresh: review.isFresh,
-        isRotten: review.isRotten,
-        quote: review.reviewQuote || review.review,
-        fullReviewUrl: review.publicationReviewUrl,
-        isSpoiler: review.hasSpoilers,
-        hasProfanity: review.hasProfanity,
-        isVerified: review.isVerified,
-        isSuperReviewer: review.isSuperReviewer,
-        userDisplayName: review.displayName,
-        userInitials: review.initials,
-        userRealm: review.user?.realm,
-        criticName: review.criticName || review.critic?.name,
-        criticSlug: review.critic?.slug,
-        publicationName: review.publicationName || review.publication?.name,
-        publicationUrl: review.publication?.url,
-        publicationIconUrl: review.publication?.icon?.url,
+        movieTitle: getField(movieDetail, 'title') || getPath(movieContext.props, ['media', 'title']),
+        movieUrl: getField(movieDetail, 'rottenTomatoesUrl') || movieContext.movieUrl,
+        mediaUrl: getField(movieDetail, 'mediaUrl'),
+        movieVanity: getField(movieDetail, 'vanity') || getPath(movieContext.props, ['vanity', 'value']),
+        movieEmsId: getField(movieDetail, 'emsMovieId') || movieContext.emsId,
+        rottenTomatoesMovieId: getField(movieDetail, 'rottenTomatoesMovieId'),
+        fandangoMovieId: getField(movieDetail, 'fandangoMovieId'),
+        releaseDate: getPath(movieDetail, ['lifecycleWindow', 'date']),
+        releaseLifecycle: getPath(movieDetail, ['lifecycleWindow', 'lifecycle']),
+        tomatometerScore: getPath(movieDetail, ['tomatometerScore', 'score']),
+        tomatometerSentiment: getPath(movieDetail, ['tomatometerScore', 'scoreSentiment']),
+        audienceScore: getPath(movieDetail, ['audienceScore', 'score']),
+        audienceSentiment: getPath(movieDetail, ['audienceScore', 'scoreSentiment']),
+        criticsConsensus: getPath(movieDetail, ['criticsConsensus', 'consensus']),
+        audienceConsensus: getPath(movieDetail, ['audienceConsensus', 'consensus']),
+        reviewId: getField(review, 'reviewId'),
+        ratingId: getField(review, 'ratingId'),
+        createDate: getField(review, 'createDate'),
+        updateDate: getField(review, 'updateDate'),
+        scoreSentiment: getField(review, 'scoreSentiment'),
+        originalScore: getField(review, 'originalScore'),
+        rating: getField(review, 'rating'),
+        isTopReview: getField(review, 'isTopReview'),
+        isFresh: getField(review, 'isFresh'),
+        isRotten: getField(review, 'isRotten'),
+        quote: getField(review, 'reviewQuote') || getField(review, 'review'),
+        fullReviewUrl: getField(review, 'publicationReviewUrl'),
+        isSpoiler: getField(review, 'hasSpoilers'),
+        hasProfanity: getField(review, 'hasProfanity'),
+        isVerified: getField(review, 'isVerified'),
+        isSuperReviewer: getField(review, 'isSuperReviewer'),
+        userDisplayName: getField(review, 'displayName'),
+        userInitials: getField(review, 'initials'),
+        userRealm: getPath(review, ['user', 'realm']),
+        criticName: getField(review, 'criticName') || getPath(review, ['critic', 'name']),
+        criticSlug: getPath(review, ['critic', 'slug']),
+        publicationName: getField(review, 'publicationName') || getPath(review, ['publication', 'name']),
+        publicationUrl: getPath(review, ['publication', 'url']),
+        publicationIconUrl: getPath(review, ['publication', 'icon', 'url']),
         rawReview: review,
     };
 
@@ -212,7 +296,9 @@ function buildReviewRecord({ review, movieContext, reviewType, page }) {
 
 function getRequestedReviewType(inputReviewType, urlReviewType) {
     if (urlReviewType && REVIEW_TYPE_TO_PARAMS[urlReviewType]) return urlReviewType;
-    if (inputReviewType && REVIEW_TYPE_TO_PARAMS[inputReviewType]) return inputReviewType;
+    const normalizedInputReviewType = String(inputReviewType || '').trim().toLowerCase().replaceAll('_', '-');
+    if (normalizedInputReviewType && REVIEW_TYPE_TO_PARAMS[normalizedInputReviewType]) return normalizedInputReviewType;
+    if (inputReviewType) log.warning(`Unknown reviewType "${inputReviewType}". Falling back to all-critics.`);
     return 'all-critics';
 }
 
@@ -249,6 +335,11 @@ try {
         throw new Error('Provide at least one Rotten Tomatoes movie URL in "urls".');
     }
 
+    const skippedUrlCount = urlCandidates.filter((candidate) => !normalizeMovieUrl(candidate)).length;
+    if (skippedUrlCount > 0) {
+        log.warning(`Skipped ${skippedUrlCount} invalid or unsupported Rotten Tomatoes URL input(s).`);
+    }
+
     const inferredTypeFromUrl = urlCandidates
         .map((candidate) => parseQueryReviewType(candidate))
         .find(Boolean);
@@ -260,7 +351,13 @@ try {
     for (const movieUrl of normalizedUrls) {
         if (totalSaved >= resultsWanted) break;
 
-        const movieContext = await resolveMovieContext(movieUrl, proxyConfig);
+        let movieContext;
+        try {
+            movieContext = await resolveMovieContext(movieUrl, proxyConfig);
+        } catch (error) {
+            log.warning(`Skipping ${movieUrl}: ${error.message}`);
+            continue;
+        }
 
         log.info(`Collecting ${selectedReviewType} reviews for: ${movieContext.movieUrl}`);
 
@@ -279,30 +376,37 @@ try {
             apiUrl.searchParams.set('type', reviewParams.type);
             apiUrl.searchParams.set('verified', String(reviewParams.verified));
 
-            const response = await requestWithProxy(proxyConfig, apiUrl.toString(), {
-                headers: {
-                    Referer: movieContext.reviewsPageUrl,
-                },
-            });
+            let response;
+            try {
+                response = await requestWithProxy(proxyConfig, apiUrl.toString(), {
+                    headers: {
+                        Referer: movieContext.reviewsPageUrl,
+                    },
+                });
+            } catch (error) {
+                log.warning(`Skipping remaining reviews for ${movieContext.movieUrl}: ${error.message}`);
+                break;
+            }
 
             if (response.statusCode !== 200) {
                 log.warning(`Reviews API returned ${response.statusCode} for ${apiUrl}`);
                 break;
             }
 
-            let payload;
-            try {
-                payload = JSON.parse(response.body);
-            } catch {
-                log.warning(`Failed parsing JSON from reviews API for ${movieContext.movieUrl}`);
+            const payload = parseJsonSafely(response.body, `reviews API for ${movieContext.movieUrl}`);
+            if (!payload) {
                 break;
             }
 
-            const pageInfo = payload?.pageInfo || {};
-            const reviews = Array.isArray(payload?.reviews) ? payload.reviews : [];
+            const pageInfo = getField(payload, 'pageInfo') || {};
+            const reviewsValue = getField(payload, 'reviews', 'edges', 'results', 'data');
+            const reviews = Array.isArray(reviewsValue) ? reviewsValue : [];
 
             if (!reviews.length) {
                 log.info(`No more reviews found on page ${page} for ${movieContext.movieUrl}`);
+                if (page === 1) {
+                    log.warning(`Reviews response did not contain a usable reviews array. Response keys: ${Object.keys(payload).join(', ')}`);
+                }
                 break;
             }
 
@@ -325,15 +429,15 @@ try {
 
             log.info(`Saved ${records.length} reviews from page ${page}. Total saved: ${totalSaved}/${resultsWanted}`);
 
-            hasNextPage = Boolean(pageInfo.hasNextPage) && records.length > 0;
-            after = pageInfo.endCursor || '';
-            before = pageInfo.startCursor || '';
+            hasNextPage = Boolean(getField(pageInfo, 'hasNextPage')) && records.length > 0;
+            after = getField(pageInfo, 'endCursor') || '';
+            before = getField(pageInfo, 'startCursor') || '';
             page += 1;
         }
     }
 
     if (totalSaved === 0) {
-        throw new Error('Run finished but no reviews were collected.');
+        log.warning('Run finished but no reviews were collected.');
     }
 
     log.info(`Finished successfully. Total reviews saved: ${totalSaved}`);
