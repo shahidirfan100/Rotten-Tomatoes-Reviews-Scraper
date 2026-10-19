@@ -1,12 +1,14 @@
 import { Actor, log } from 'apify';
-import { Dataset } from 'crawlee';
-import { chromium } from 'playwright';
+import * as cheerio from 'cheerio';
+import { Impit } from 'impit';
 
 const BASE_URL = 'https://www.rottentomatoes.com';
 const DEFAULT_RESULTS_WANTED = 20;
 const DEFAULT_MAX_PAGES = 10;
 const PAGE_SIZE = 20;
 const REQUEST_TIMEOUT_MS = 30000;
+const MAX_ATTEMPTS = 3;
+const BROWSER_PROFILES = ['chrome', 'firefox', 'chrome142', 'okhttp4', 'ios18'];
 
 const REVIEW_TYPE_TO_PARAMS = {
     'all-critics': { type: 'critic', topOnly: false, verified: false },
@@ -16,6 +18,12 @@ const REVIEW_TYPE_TO_PARAMS = {
 };
 
 await Actor.init();
+
+function sleep(ms) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+}
 
 function clampInteger(value, fallback, min = 1, max = Number.MAX_SAFE_INTEGER) {
     const parsed = Number.parseInt(String(value ?? ''), 10);
@@ -75,6 +83,13 @@ function cleanObject(value) {
     return value;
 }
 
+function absoluteUrl(href) {
+    if (!href || typeof href !== 'string') return undefined;
+    if (/^https?:\/\//i.test(href)) return href;
+    if (href.startsWith('/')) return `${BASE_URL}${href}`;
+    return href;
+}
+
 function normalizeMovieUrl(rawUrl) {
     const inputValue = getInputValue(rawUrl);
     if (!inputValue || typeof inputValue !== 'string') return null;
@@ -118,14 +133,121 @@ function parseQueryReviewType(urlString) {
     return null;
 }
 
-function extractDataJsonBlock(html, key) {
-    const pattern = new RegExp(`<script[^>]*data-json=["']${key}["'][^>]*>([\\s\\S]*?)<\\/script>`, 'i');
-    const match = html.match(pattern);
-    if (!match) return null;
+function getRequestedReviewType(inputReviewType, urlReviewType) {
+    if (urlReviewType && REVIEW_TYPE_TO_PARAMS[urlReviewType]) return urlReviewType;
+    const normalizedInputReviewType = String(inputReviewType || '').trim().toLowerCase().replaceAll('_', '-');
+    if (normalizedInputReviewType && REVIEW_TYPE_TO_PARAMS[normalizedInputReviewType]) return normalizedInputReviewType;
+    if (inputReviewType) log.warning(`Unknown reviewType "${inputReviewType}". Falling back to all-critics.`);
+    return 'all-critics';
+}
 
-    const payload = match[1]?.trim();
+function createCookieJar() {
+    const store = new Map();
+    return {
+        setCookie(cookieString) {
+            const pair = String(cookieString || '').split(';')[0];
+            const separator = pair.indexOf('=');
+            if (separator <= 0) return;
+            store.set(pair.slice(0, separator).trim(), pair.slice(separator + 1).trim());
+        },
+        getCookieString() {
+            return [...store.entries()].map(([name, value]) => `${name}=${value}`).join('; ');
+        },
+        size() {
+            return store.size;
+        },
+    };
+}
+
+class RtSession {
+    constructor(proxyUrl) {
+        this.proxyUrl = proxyUrl;
+        this.jar = createCookieJar();
+        this.clients = new Map();
+        this.activeProfile = null;
+    }
+
+    client(profile) {
+        if (!this.clients.has(profile)) {
+            this.clients.set(
+                profile,
+                new Impit({
+                    browser: profile,
+                    cookieJar: this.jar,
+                    timeout: REQUEST_TIMEOUT_MS,
+                    ...(this.proxyUrl && { proxyUrl: this.proxyUrl }),
+                }),
+            );
+        }
+        return this.clients.get(profile);
+    }
+
+    setActiveProfile(profile) {
+        this.activeProfile = profile;
+    }
+}
+
+function retryDelay(attempt, response) {
+    const retryAfter = Number.parseInt(response?.headers?.get('retry-after') ?? '', 10);
+    if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter * 1000, 15000);
+    return Math.min(750 * 2 ** (attempt - 1), 8000) + Math.round(Math.random() * 400);
+}
+
+async function fetchWithRetry(client, url, options, attempts = MAX_ATTEMPTS) {
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+            const response = await client.fetch(url, options);
+            const isTemporary = response.status === 429 || response.status >= 500;
+            if (isTemporary && attempt < attempts) {
+                const wait = retryDelay(attempt, response);
+                log.warning(`HTTP ${response.status} for ${url} — retrying in ${Math.round(wait)}ms (attempt ${attempt}/${attempts})`);
+                await sleep(wait);
+                lastError = new Error(`HTTP ${response.status}`);
+                continue;
+            }
+            return response;
+        } catch (error) {
+            lastError = error;
+            if (attempt < attempts) {
+                const wait = retryDelay(attempt);
+                log.warning(`Request error (${error.message}) — retrying in ${Math.round(wait)}ms (attempt ${attempt}/${attempts})`);
+                await sleep(wait);
+            }
+        }
+    }
+    throw lastError ?? new Error(`Request failed for ${url}`);
+}
+
+async function fetchMoviePage(session, movieUrl) {
+    let lastStatus = null;
+    for (const profile of BROWSER_PROFILES) {
+        const client = session.client(profile);
+        try {
+            const response = await fetchWithRetry(
+                client,
+                movieUrl,
+                { headers: { accept: 'text/html,application/xhtml+xml' } },
+                2,
+            );
+            if (response.status === 200) {
+                session.setActiveProfile(profile);
+                return await response.text();
+            }
+            lastStatus = response.status;
+            log.warning(`Profile "${profile}" returned HTTP ${response.status} for ${movieUrl}`);
+        } catch (error) {
+            log.warning(`Profile "${profile}" failed for ${movieUrl}: ${error.message}`);
+        }
+    }
+    throw new Error(`Could not load movie page (last HTTP status ${lastStatus ?? 'n/a'}).`);
+}
+
+function parseJsonScript($, key) {
+    const element = $(`script[data-json="${key}"]`).first();
+    if (!element.length) return null;
+    const payload = element.text().trim();
     if (!payload) return null;
-
     try {
         return JSON.parse(payload);
     } catch {
@@ -133,197 +255,114 @@ function extractDataJsonBlock(html, key) {
     }
 }
 
-async function createBrowserPage(proxyUrl) {
-    const browser = await chromium.launch({
-        headless: true,
-        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
-        ...(proxyUrl && { proxy: { server: proxyUrl } }),
-    });
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36',
-        locale: 'en-US',
-        extraHTTPHeaders: {
-            'sec-ch-ua': '"Chromium";v="147", "Google Chrome";v="147", "Not.A/Brand";v="24"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Windows"',
-        },
-    });
-    const page = await context.newPage();
-
-    await page.addInitScript(() => {
-        Object.defineProperty(navigator, 'webdriver', { get: () => false });
-        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-        window.chrome = window.chrome || { runtime: {} };
-    });
-
-    await page.route('**/*', (route) => {
-        const resourceType = route.request().resourceType();
-        if (['image', 'font', 'media'].includes(resourceType)) return route.abort();
-        return route.continue();
-    });
-
-    return { browser, page };
+function extractConsensus($) {
+    const element = $('#critics-consensus');
+    if (!element.length) return undefined;
+    const text = element
+        .text()
+        .replace(/\s+/g, ' ')
+        .replace(/Critics Consensus/i, '')
+        .replace(/Read Critics Reviews[\s\S]*$/i, '')
+        .trim();
+    return text || undefined;
 }
 
-function buildMovieContext(movieUrl, reviewsPageUrl, html) {
-    const props = extractDataJsonBlock(html, 'props');
-    const reviewsData = extractDataJsonBlock(html, 'reviewsData');
-
-    const emsId = getPath(props, ['vanity', 'emsId'])
-        || getPath(props, ['media', 'emsId'])
-        || getPath(reviewsData, ['media', 'emsId']);
-    if (!emsId) {
-        throw new Error(`Failed to resolve movie ID from ${reviewsPageUrl}`);
-    }
+function buildMovieMeta($, vanity, scorecard, reviewsData) {
+    const criticsScore = scorecard?.criticsScore || reviewsData?.criticsScore;
+    const audienceScore = scorecard?.audienceScore || reviewsData?.audienceScore;
 
     return {
-        movieUrl,
-        reviewsPageUrl,
-        emsId,
-        props: props || {},
-        movieDetails: {},
+        movieTitle: vanity?.title || reviewsData?.title || getPath(scorecard, ['cta', 'buttonAnnouncement']),
+        movieUrl: vanity?.href ? `${BASE_URL}${vanity.href}` : undefined,
+        movieVanity: vanity?.value,
+        movieEmsId: vanity?.emsId || reviewsData?.vanity?.emsId,
+        releaseDate: vanity?.lifecycleWindow?.date,
+        releaseLifecycle: vanity?.lifecycleWindow?.lifecycle,
+        tomatometerScore: criticsScore?.score,
+        tomatometerSentiment: criticsScore?.sentiment,
+        tomatometerReviews: criticsScore?.reviewCount,
+        audienceScore: audienceScore?.score,
+        audienceSentiment: audienceScore?.sentiment,
+        audienceReviews: audienceScore?.reviewCount,
+        criticsConsensus: extractConsensus($),
     };
 }
 
-async function collectReviewsWithBrowser({
-    movieUrl,
-    reviewParams,
-    selectedReviewType,
-    maxPages,
-    resultsWanted,
-    totalSaved,
-    proxyUrl,
-}) {
-    let browser;
-    let saved = 0;
+function parseCriticCards($, meta, reviewType) {
+    const records = [];
 
-    try {
-        const browserSession = await createBrowserPage(proxyUrl);
-        browser = browserSession.browser;
-        const { page } = browserSession;
-        const reviewsPageUrl = `${movieUrl}/reviews`;
+    $('review-card-critic').each((_, element) => {
+        const card = $(element);
+        const attributes = card.attr() || {};
+        const nameSlot = card.find('[slot="name"]').first();
+        const publicationSlot = card.find('[slot="publication"]').first();
+        const ratingSlot = card.find('[slot="rating"]').first();
+        const sentiment = ratingSlot.find('score-icon-critics').attr('sentiment');
+        const normalizedSentiment = sentiment ? sentiment.toUpperCase() : undefined;
+        const originalScore = ratingSlot.find('span').first().text().replace(/\s+/g, ' ').trim();
 
-        await page.goto(reviewsPageUrl, { waitUntil: 'domcontentloaded', timeout: REQUEST_TIMEOUT_MS });
-        await page.waitForLoadState('networkidle', { timeout: REQUEST_TIMEOUT_MS }).catch(() => {});
+        records.push(cleanObject({
+            ...meta,
+            source: 'public-page',
+            queryReviewType: reviewType,
+            page: 1,
+            reviewId: attributes['data-review-id'],
+            createDate: card.find('[slot="timestamp"]').first().text().trim(),
+            scoreSentiment: normalizedSentiment,
+            originalScore,
+            isTopReview: Object.prototype.hasOwnProperty.call(attributes, 'top-critic'),
+            isTopCritic: Object.prototype.hasOwnProperty.call(attributes, 'top-critic'),
+            isFresh: normalizedSentiment ? normalizedSentiment === 'POSITIVE' : undefined,
+            isRotten: normalizedSentiment ? normalizedSentiment === 'NEGATIVE' : undefined,
+            quote: card.find('[slot="review"]').first().text().replace(/\s+/g, ' ').trim(),
+            fullReviewUrl: card.find('[slot="review-link"]').first().attr('href'),
+            criticName: nameSlot.text().replace(/\s+/g, ' ').trim(),
+            criticSlug: (nameSlot.attr('href') || '').split('/').filter(Boolean).pop(),
+            publicationName: publicationSlot.text().replace(/\s+/g, ' ').trim(),
+            publicationUrl: absoluteUrl(publicationSlot.attr('href')),
+            rawReview: { attributes },
+        }));
+    });
 
-        const movieContext = buildMovieContext(movieUrl, reviewsPageUrl, await page.content());
-        log.info(`Collecting ${selectedReviewType} reviews for: ${movieContext.movieUrl}`);
-
-        const pages = await page.evaluate(
-            async (browserRequestConfig) => {
-                const {
-                    baseUrl,
-                    emsId,
-                    reviewParams: browserReviewParams,
-                    pageSize,
-                    resultsWanted: browserResultsWanted,
-                    totalSaved: browserTotalSaved,
-                    maxPages: browserMaxPages,
-                } = browserRequestConfig;
-                const collectedPages = [];
-                let after = '';
-                let before = '';
-                let pageNumber = 1;
-                let savedCount = browserTotalSaved;
-                let hasNextPage = true;
-
-                while (hasNextPage && pageNumber <= browserMaxPages && savedCount < browserResultsWanted) {
-                    const pageCount = Math.min(pageSize, browserResultsWanted - savedCount);
-                    const apiUrl = new URL(`${baseUrl}/napi/rtcf/v1/movies/${emsId}/reviews`);
-                    apiUrl.searchParams.set('after', after);
-                    apiUrl.searchParams.set('before', before);
-                    apiUrl.searchParams.set('pageCount', String(pageCount));
-                    apiUrl.searchParams.set('topOnly', String(browserReviewParams.topOnly));
-                    apiUrl.searchParams.set('type', browserReviewParams.type);
-                    apiUrl.searchParams.set('verified', String(browserReviewParams.verified));
-
-                    const response = await fetch(apiUrl.toString());
-                    if (!response.ok) {
-                        throw new Error(`Browser reviews API returned ${response.status} for ${apiUrl}`);
-                    }
-
-                    const payload = await response.json();
-                    const reviews = Array.isArray(payload?.reviews) ? payload.reviews : [];
-                    const pageInfo = payload?.pageInfo || {};
-                    collectedPages.push({ page: pageNumber, reviews, pageInfo });
-
-                    if (!reviews.length) break;
-
-                    savedCount += reviews.length;
-                    hasNextPage = Boolean(pageInfo.hasNextPage);
-                    after = pageInfo.endCursor || '';
-                    before = pageInfo.startCursor || '';
-                    pageNumber += 1;
-                }
-
-                return collectedPages;
-            },
-            {
-                baseUrl: BASE_URL,
-                emsId: movieContext.emsId,
-                reviewParams,
-                pageSize: PAGE_SIZE,
-                resultsWanted,
-                totalSaved,
-                maxPages,
-            },
-        );
-
-        for (const browserPage of pages) {
-            const remainingSlots = resultsWanted - totalSaved - saved;
-            const records = browserPage.reviews
-                .slice(0, remainingSlots)
-                .map((review) => buildReviewRecord({
-                    review,
-                    movieContext,
-                    reviewType: selectedReviewType,
-                    page: browserPage.page,
-                }))
-                .filter(Boolean);
-
-            if (!records.length) break;
-
-            await Dataset.pushData(records);
-            saved += records.length;
-            log.info(`Saved ${records.length} reviews from page ${browserPage.page}. Total saved: ${totalSaved + saved}/${resultsWanted}`);
-        }
-    } finally {
-        if (browser) await browser.close();
-    }
-
-    return saved;
+    return records;
 }
 
-function buildReviewRecord({ review, movieContext, reviewType, page }) {
-    const movieDetail = movieContext.movieDetails;
+function parseAudienceReviews(reviewsData, meta, reviewType) {
+    const reviews = Array.isArray(reviewsData?.reviews) ? reviewsData.reviews : [];
 
-    const baseRecord = {
+    return reviews.map((review) => cleanObject({
+        ...meta,
+        source: 'public-page',
+        queryReviewType: reviewType,
+        page: 1,
+        ratingId: getField(review, 'ratingId'),
+        createDate: getField(review, 'displayDate'),
+        rating: getField(review, 'rating') !== undefined ? String(getField(review, 'rating')) : undefined,
+        ratingRange: getField(review, 'ratingRangeA11y') || getField(review, 'ratingRange'),
+        isVerified: getField(review, 'isVerified'),
+        isFandangoReview: getField(review, 'isFandangoReview'),
+        userDisplayName: getField(review, 'displayName'),
+        userInitials: getField(review, 'avatarInitials'),
+        userRealm: getPath(review, ['user', 'realm']),
+        userProfileLink: absoluteUrl(getField(review, 'profileLink')),
+        quote: getField(review, 'review'),
+        rawReview: review,
+    }));
+}
+
+function mapApiReview(review, meta, reviewType, page) {
+    return cleanObject({
+        ...meta,
+        source: 'reviews-api',
         queryReviewType: reviewType,
         page,
-        movieTitle: getField(movieDetail, 'title') || getPath(movieContext.props, ['media', 'title']),
-        movieUrl: getField(movieDetail, 'rottenTomatoesUrl') || movieContext.movieUrl,
-        mediaUrl: getField(movieDetail, 'mediaUrl') || getPath(movieContext.props, ['media', 'link']),
-        movieVanity: getField(movieDetail, 'vanity') || getPath(movieContext.props, ['vanity', 'value']),
-        movieEmsId: getField(movieDetail, 'emsMovieId') || movieContext.emsId,
-        rottenTomatoesMovieId: getField(movieDetail, 'rottenTomatoesMovieId'),
-        fandangoMovieId: getField(movieDetail, 'fandangoMovieId'),
-        releaseDate: getPath(movieDetail, ['lifecycleWindow', 'date']) || getPath(movieContext.props, ['vanity', 'lifecycleWindow', 'date']),
-        releaseLifecycle: getPath(movieDetail, ['lifecycleWindow', 'lifecycle']) || getPath(movieContext.props, ['vanity', 'lifecycleWindow', 'lifecycle']),
-        tomatometerScore: getPath(movieDetail, ['tomatometerScore', 'score']) || getPath(movieContext.props, ['media', 'tomatometerScore', 'value']),
-        tomatometerSentiment: getPath(movieDetail, ['tomatometerScore', 'scoreSentiment'])
-            || getPath(movieContext.props, ['media', 'tomatometerScore', 'state']),
-        audienceScore: getPath(movieDetail, ['audienceScore', 'score']),
-        audienceSentiment: getPath(movieDetail, ['audienceScore', 'scoreSentiment']),
-        criticsConsensus: getPath(movieDetail, ['criticsConsensus', 'consensus']),
-        audienceConsensus: getPath(movieDetail, ['audienceConsensus', 'consensus']),
         reviewId: getField(review, 'reviewId'),
         ratingId: getField(review, 'ratingId'),
         createDate: getField(review, 'createDate'),
         updateDate: getField(review, 'updateDate'),
         scoreSentiment: getField(review, 'scoreSentiment'),
         originalScore: getField(review, 'originalScore'),
-        rating: getField(review, 'rating'),
+        rating: getField(review, 'rating') !== undefined ? String(getField(review, 'rating')) : undefined,
         isTopReview: getField(review, 'isTopReview'),
         isFresh: getField(review, 'isFresh'),
         isRotten: getField(review, 'isRotten'),
@@ -342,17 +381,126 @@ function buildReviewRecord({ review, movieContext, reviewType, page }) {
         publicationUrl: getPath(review, ['publication', 'url']) || getPath(review, ['publication', 'editorialUrl']),
         publicationIconUrl: getPath(review, ['publication', 'icon', 'url']),
         rawReview: review,
-    };
-
-    return cleanObject(baseRecord);
+    });
 }
 
-function getRequestedReviewType(inputReviewType, urlReviewType) {
-    if (urlReviewType && REVIEW_TYPE_TO_PARAMS[urlReviewType]) return urlReviewType;
-    const normalizedInputReviewType = String(inputReviewType || '').trim().toLowerCase().replaceAll('_', '-');
-    if (normalizedInputReviewType && REVIEW_TYPE_TO_PARAMS[normalizedInputReviewType]) return normalizedInputReviewType;
-    if (inputReviewType) log.warning(`Unknown reviewType "${inputReviewType}". Falling back to all-critics.`);
-    return 'all-critics';
+async function tryReviewsApi({ session, emsId, movieUrl, reviewType, params, maxPages, limit }) {
+    const client = session.client(session.activeProfile || 'chrome');
+    const records = [];
+    let after = '';
+    let before = '';
+
+    for (let page = 1; page <= maxPages && records.length < limit; page++) {
+        const url = new URL(`${BASE_URL}/napi/rtcf/v1/movies/${emsId}/reviews`);
+        url.searchParams.set('after', after);
+        url.searchParams.set('before', before);
+        url.searchParams.set('pageCount', String(Math.min(PAGE_SIZE, limit - records.length)));
+        url.searchParams.set('topOnly', String(params.topOnly));
+        url.searchParams.set('type', params.type);
+        url.searchParams.set('verified', String(params.verified));
+
+        let response;
+        try {
+            response = await fetchWithRetry(
+                client,
+                url.toString(),
+                { headers: { accept: 'application/json', referer: `${movieUrl}/reviews` } },
+                2,
+            );
+        } catch (error) {
+            return { ok: false, reason: error.message, records };
+        }
+
+        if (response.status !== 200) {
+            return { ok: false, reason: `HTTP ${response.status}`, records };
+        }
+
+        const body = await response.text();
+        let payload;
+        try {
+            payload = JSON.parse(body);
+        } catch {
+            return { ok: false, reason: 'response was not JSON', records };
+        }
+
+        const reviews = Array.isArray(payload?.reviews) ? payload.reviews : [];
+        if (!reviews.length) break;
+
+        for (const review of reviews) records.push(mapApiReview(review, {}, reviewType, page));
+
+        const pageInfo = payload?.pageInfo || {};
+        if (pageInfo.hasNextPage !== true) break;
+        after = pageInfo.endCursor || '';
+        before = pageInfo.startCursor || '';
+    }
+
+    return { ok: records.length > 0, reason: records.length ? 'ok' : 'empty payload', records };
+}
+
+function selectPageRecords($, reviewsData, meta, reviewType, params) {
+    if (params.type === 'critic') {
+        const critics = parseCriticCards($, meta, reviewType);
+        const topCritics = params.topOnly ? critics.filter((record) => record.isTopReview) : critics;
+        const selected = params.topOnly && topCritics.length ? topCritics : critics;
+        return selected.map((record) => ({ ...record, rawReview: record.rawReview }));
+    }
+
+    const audience = parseAudienceReviews(reviewsData, meta, reviewType);
+    const verified = params.verified ? audience.filter((record) => record.isVerified) : audience;
+    return params.verified && verified.length ? verified : audience;
+}
+
+function dedupeRecords(records) {
+    const seen = new Set();
+    const unique = [];
+    for (const record of records) {
+        const key = record.reviewId || record.ratingId
+            || `${record.criticName || ''}|${record.userDisplayName || ''}|${record.quote || ''}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        unique.push(record);
+    }
+    return unique;
+}
+
+async function collectMovieReviews({ session, movieUrl, reviewType, maxPages, resultsWanted, totalSaved }) {
+    const html = await fetchMoviePage(session, movieUrl);
+    const $ = cheerio.load(html);
+
+    const vanity = parseJsonScript($, 'vanity');
+    const scorecard = parseJsonScript($, 'mediaScorecard');
+    const reviewsData = parseJsonScript($, 'reviewsData');
+    const meta = buildMovieMeta($, vanity, scorecard, reviewsData);
+
+    const emsId = meta.movieEmsId;
+    const params = REVIEW_TYPE_TO_PARAMS[reviewType];
+    const remaining = resultsWanted - totalSaved;
+
+    let records = [];
+    if (emsId) {
+        const apiResult = await tryReviewsApi({ session, emsId, movieUrl, reviewType, params, maxPages, limit: remaining });
+        if (apiResult.records.length) {
+            records = apiResult.records.map((record) => ({ ...meta, ...record }));
+            log.info(`Collected ${records.length} reviews from the reviews service for ${meta.movieTitle || movieUrl}.`);
+        } else {
+            log.info(`Reviews service unavailable (${apiResult.reason}) for ${movieUrl}; using server-rendered review data.`);
+        }
+    }
+
+    if (!records.length) {
+        records = selectPageRecords($, reviewsData, meta, reviewType, params);
+    }
+
+    records = dedupeRecords(records).slice(0, remaining);
+
+    if (!records.length) {
+        log.warning(`No ${reviewType} reviews found on ${movieUrl}.`);
+        return 0;
+    }
+
+    await Actor.pushData(records);
+    log.info(`Saved ${records.length} reviews for ${meta.movieTitle || movieUrl}. Total: ${totalSaved + records.length}/${resultsWanted}`);
+    return records.length;
 }
 
 try {
@@ -398,34 +546,40 @@ try {
         .map((candidate) => parseQueryReviewType(candidate))
         .find(Boolean);
     const selectedReviewType = getRequestedReviewType(reviewType, inferredTypeFromUrl);
-    const reviewParams = REVIEW_TYPE_TO_PARAMS[selectedReviewType];
 
+    const session = new RtSession(proxyUrl);
     let totalSaved = 0;
+    let loadedPages = 0;
+    let failedPages = 0;
 
     for (const movieUrl of normalizedUrls) {
         if (totalSaved >= resultsWanted) break;
 
         try {
-            const saved = await collectReviewsWithBrowser({
+            const saved = await collectMovieReviews({
+                session,
                 movieUrl,
-                reviewParams,
-                selectedReviewType,
+                reviewType: selectedReviewType,
                 maxPages,
                 resultsWanted,
                 totalSaved,
-                proxyUrl,
             });
             totalSaved += saved;
+            loadedPages++;
         } catch (error) {
+            failedPages++;
             log.warning(`Skipping ${movieUrl}: ${error.message}`);
         }
     }
 
     if (totalSaved === 0) {
-        log.warning('Run finished but no reviews were collected.');
+        if (loadedPages === 0 && failedPages > 0) {
+            throw new Error('Unable to collect any reviews: every movie page failed to load.');
+        }
+        log.warning('Run finished but no reviews were collected for the requested review type.');
     }
 
-    log.info(`Finished successfully. Total reviews saved: ${totalSaved}`);
+    log.info(`Finished. Total reviews saved: ${totalSaved} (pages loaded: ${loadedPages}, failed: ${failedPages}).`);
     await Actor.exit();
 } catch (error) {
     log.exception(error, 'Actor failed');

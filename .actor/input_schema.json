@@ -10,7 +10,10 @@
       "description": "Add one or more Rotten Tomatoes movie URLs. Supports messy variants like /reviews, query params, and hash fragments.",
       "editor": "stringList",
       "prefill": [
-        "https://www.rottentomatoes.com/m/mortal_kombat_ii#critics-reviews"
+        "https://www.rottentomatoes.com/m/inception"
+      ],
+      "default": [
+        "https://www.rottentomatoes.com/m/inception"
       ],
       "items": {
         "type": "string"
@@ -22,7 +25,6 @@
       "description": "Review set to collect.",
       "editor": "select",
       "default": "all-critics",
-      "prefill": "all-critics",
       "enum": [
         "all-critics",
         "top-critics",
@@ -41,15 +43,13 @@
       "type": "integer",
       "description": "Maximum number of reviews to collect.",
       "default": 20,
-      "prefill": 20,
       "editor": "number"
     },
     "max_pages": {
       "title": "Max Pages",
       "type": "integer",
-      "description": "Maximum API pages to request per movie.",
+      "description": "Maximum result pages to request per movie.",
       "default": 10,
-      "prefill": 10,
       "editor": "number"
     },
     "proxyConfiguration": {

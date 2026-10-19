@@ -6,8 +6,9 @@ Extract Rotten Tomatoes movie reviews with a single run. Collect critic or audie
 
 - **URL list input** - Add one or more Rotten Tomatoes movie URLs in a single run.
 - **Multiple review modes** - Collect All Critics, Top Critics, All Audience, or Verified Audience reviews.
-- **Pagination support** - Automatically fetches additional pages until your limits are reached.
-- **Clean output** - Removes null and empty values from dataset items.
+- **Resilient collection** - Automatically retries temporary failures, rotates request profiles, and keeps collecting when one title is temporarily unavailable.
+- **Rich review records** - Captures review text, sentiment, scores, dates, critic and publication details, audience ratings, and verification flags.
+- **Clean output** - Removes null and empty values from dataset items so every record is ready to use.
 - **Production-ready controls** - Includes result caps, page caps, and proxy configuration.
 
 ## Use Cases
@@ -30,11 +31,11 @@ Compare review signals across multiple titles using the same structured output f
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `urls` | Array<String> | No | `["https://www.rottentomatoes.com/m/mortal_kombat_ii#critics-reviews"]` | One or more Rotten Tomatoes movie URLs. Supports `/reviews`, query params, and hash fragments. |
+| `urls` | Array<String> | No | `["https://www.rottentomatoes.com/m/inception"]` | One or more Rotten Tomatoes movie URLs. Accepts `/reviews`, query params, and hash fragments. |
 | `reviewType` | String | No | `"all-critics"` | One of `all-critics`, `top-critics`, `all-audience`, `verified-audience`. |
 | `results_wanted` | Integer | No | `20` | Maximum number of reviews to collect. |
 | `max_pages` | Integer | No | `10` | Maximum pages to request per movie. |
-| `proxyConfiguration` | Object | No | Apify Proxy Residential | Proxy settings for reliable collection. |
+| `proxyConfiguration` | Object | No | Apify Proxy disabled | Proxy settings for request routing. |
 
 ---
 
@@ -45,44 +46,42 @@ Each dataset item can include:
 | Field | Type | Description |
 |-------|------|-------------|
 | `movieTitle` | String | Movie title |
-| `queryReviewType` | String | Selected review mode |
 | `movieUrl` | String | Canonical movie URL |
-| `movieVanity` | String | Movie vanity slug |
-| `movieEmsId` | String | Internal movie identifier |
-| `rottenTomatoesMovieId` | String | Rotten Tomatoes movie ID |
-| `fandangoMovieId` | String | Fandango movie ID |
+| `movieVanity` | String | Movie slug |
+| `movieEmsId` | String | Movie identifier |
 | `releaseDate` | String | Release date |
 | `releaseLifecycle` | String | Release lifecycle status |
 | `tomatometerScore` | String | Tomatometer score |
 | `tomatometerSentiment` | String | Tomatometer sentiment |
+| `tomatometerReviews` | Number | Number of critic reviews counted |
 | `audienceScore` | String | Audience score |
 | `audienceSentiment` | String | Audience sentiment |
-| `criticsConsensus` | String | Critics consensus |
-| `audienceConsensus` | String | Audience consensus |
-| `reviewId` | String | Critic review ID |
-| `ratingId` | String | Audience rating ID |
-| `createDate` | String | Review creation timestamp |
-| `updateDate` | String | Review update timestamp |
-| `scoreSentiment` | String | Review sentiment |
+| `audienceReviews` | Number | Number of audience reviews counted |
+| `criticsConsensus` | String | Critics consensus text |
+| `queryReviewType` | String | Selected review mode |
+| `source` | String | Where the record was collected from |
+| `page` | Number | Result page number |
+| `createDate` | String | Review publication date |
+| `scoreSentiment` | String | Review sentiment (critic reviews) |
 | `originalScore` | String | Original critic score text |
-| `rating` | String | Audience rating value |
-| `isTopReview` | Boolean | Top critic flag |
-| `isFresh` | Boolean | Fresh flag |
-| `isRotten` | Boolean | Rotten flag |
+| `rating` | String | Audience star rating |
+| `ratingRange` | String | Audience rating description |
 | `quote` | String | Review text |
 | `fullReviewUrl` | String | External full review link |
-| `isSpoiler` | Boolean | Spoiler flag |
-| `hasProfanity` | Boolean | Profanity flag |
+| `isTopReview` | Boolean | Top review flag |
+| `isTopCritic` | Boolean | Top critic flag (critic reviews) |
+| `isFresh` | Boolean | Fresh flag (critic reviews) |
+| `isRotten` | Boolean | Rotten flag (critic reviews) |
 | `isVerified` | Boolean | Verified audience flag |
-| `isSuperReviewer` | Boolean | Super reviewer flag |
+| `isFandangoReview` | Boolean | Fandango-sourced audience review |
 | `userDisplayName` | String | Audience display name |
 | `userInitials` | String | Audience initials |
-| `userRealm` | String | Audience user realm |
+| `userRealm` | String | Audience account realm |
+| `userProfileLink` | String | Audience profile link |
 | `criticName` | String | Critic name |
 | `criticSlug` | String | Critic slug |
 | `publicationName` | String | Publication name |
-| `publicationUrl` | String | Publication URL |
-| `publicationIconUrl` | String | Publication icon URL |
+| `publicationUrl` | String | Publication link |
 | `rawReview` | Object | Original review payload |
 
 ---
@@ -94,7 +93,7 @@ Each dataset item can include:
 ```json
 {
   "urls": [
-    "https://www.rottentomatoes.com/m/mortal_kombat_ii#critics-reviews"
+    "https://www.rottentomatoes.com/m/inception"
   ],
   "results_wanted": 20,
   "max_pages": 5
@@ -106,7 +105,7 @@ Each dataset item can include:
 ```json
 {
   "urls": [
-    "https://www.rottentomatoes.com/m/mortal_kombat_ii/reviews?type=user"
+    "https://www.rottentomatoes.com/m/inception/reviews?type=user"
   ],
   "reviewType": "all-audience",
   "results_wanted": 40
@@ -119,7 +118,7 @@ Each dataset item can include:
 {
   "urls": [
     "https://www.rottentomatoes.com/m/inception",
-    "https://www.rottentomatoes.com/m/mortal_kombat_ii#critics-reviews"
+    "https://www.rottentomatoes.com/m/the_dark_knight"
   ],
   "reviewType": "top-critics",
   "results_wanted": 30,
@@ -133,21 +132,30 @@ Each dataset item can include:
 
 ```json
 {
+  "movieTitle": "Inception",
+  "movieUrl": "https://www.rottentomatoes.com/m/inception",
+  "movieVanity": "inception",
+  "movieEmsId": "afbf1c81-1bfe-3996-9cbc-2e1be23d1f61",
+  "releaseDate": "2010-07-16",
+  "releaseLifecycle": "OUT_OF_THEATERS",
+  "tomatometerScore": "86",
+  "tomatometerSentiment": "POSITIVE",
+  "audienceScore": "91",
+  "audienceSentiment": "POSITIVE",
+  "criticsConsensus": "Smart, innovative, and thrilling, Inception is that rare summer blockbuster that succeeds viscerally as well as intellectually.",
+  "source": "public-page",
   "queryReviewType": "all-critics",
   "page": 1,
-  "movieTitle": "Mortal Kombat II",
-  "movieUrl": "https://www.rottentomatoes.com/m/mortal_kombat_ii",
-  "movieVanity": "mortal_kombat_ii",
-  "movieEmsId": "94e1d509-39a2-4c9b-8ca8-ef6ea6e92c39",
-  "rottenTomatoesMovieId": "900088891",
-  "createDate": "2026-05-11T22:16:45.000Z",
+  "createDate": "Mar 20, 2024",
   "scoreSentiment": "POSITIVE",
-  "originalScore": "3.5/5",
-  "isTopReview": false,
-  "quote": "A film like this is never going to get the emotional beats right.",
-  "criticName": "Aisha Harris",
-  "publicationName": "NPR",
-  "fullReviewUrl": "https://www.npr.org/transcripts/nx-s1-5814848"
+  "isTopReview": true,
+  "isTopCritic": true,
+  "isFresh": true,
+  "quote": "Nolan is exploring dreams and the possibilities are endless, which is why it's a little disappointing that so much of the film feels like a generic CGI action movie, albeit a high-class one.",
+  "criticName": "Wendy Ide",
+  "criticSlug": "wendy-ide",
+  "publicationName": "The Times (UK)",
+  "fullReviewUrl": "https://www.thetimes.co.uk/article/whats-on-tv-and-radio-tonight-wednesday-march-20-3wg7jpprw"
 }
 ```
 
@@ -212,7 +220,10 @@ Each run uses one `reviewType`. Run twice with different `reviewType` values for
 Not every review includes every field. Empty values are automatically removed.
 
 ### Can I collect all available reviews?
-Yes. Increase `results_wanted` and `max_pages` based on your needs.
+The actor collects every review Rotten Tomatoes exposes for each title and continues across all the movie URLs you provide. Add more titles to grow your dataset.
+
+### What happens if a title is temporarily unavailable?
+The actor retries temporary failures, rotates request profiles, and moves on to the next title instead of failing the whole run. Re-run later to pick up anything that was missed.
 
 ---
 
