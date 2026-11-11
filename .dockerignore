@@ -3,13 +3,16 @@
 .vscode
 .zed
 
-# crawlee and apify storage folders
+# apify storage folders
 apify_storage
 crawlee_storage
 storage
 
 # installed files
 node_modules
+__pycache__
+*.pyc
+.venv
 
 # git folder
 .git

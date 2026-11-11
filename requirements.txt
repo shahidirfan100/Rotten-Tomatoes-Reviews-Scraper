@@ -1,0 +1,2 @@
+apify>=3.0,<5
+scrapling[fetchers]>=0.5.1,<0.6.0
